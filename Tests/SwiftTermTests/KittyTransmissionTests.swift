@@ -12,8 +12,12 @@ final class KittyTransmissionTests {
     @_silgen_name("shm_open")
     private static func swiftShmOpen(_ name: UnsafePointer<CChar>, _ oflag: Int32, _ mode: mode_t) -> Int32
 
+    /// These tests cover the local media themselves (their path checks), so
+    /// the terminal opts in to them; `KittyLocalTransmissionPolicyTests`
+    /// covers the default, which refuses them.
     private func makeHeadlessTerminal() -> HeadlessTerminal {
-        HeadlessTerminal(queue: SwiftTermTests.queue, options: TerminalOptions(cols: 10, rows: 5)) { _ in }
+        HeadlessTerminal(queue: SwiftTermTests.queue,
+                         options: TerminalOptions(cols: 10, rows: 5, allowKittyLocalFileTransmission: true)) { _ in }
     }
 
     private func sendKitty(terminal: Terminal, control: String, payload: Data) {

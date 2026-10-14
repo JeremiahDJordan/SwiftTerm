@@ -6393,6 +6393,7 @@ open class Terminal {
         let savedCursorHidden = cursorHidden
         setup (isReset: true)
         clearAllKittyImages()
+        kittyGraphicsState.pending = nil
         cursorHidden = savedCursorHidden
         refresh (startRow: 0, endRow: rows-1)
         syncScrollArea ()

@@ -593,6 +593,19 @@ public class EscapeSequenceParser {
         }
     }
 
+    /// How many bytes of an APC sequence starting with `command` are buffered.
+    /// Only kitty graphics (`G`, while the terminal handles it) reads the
+    /// content, so every other sequence keeps just its command byte, which
+    /// is all the fallback handler is given. Kitty graphics keeps one byte
+    /// more than the longest sequence it takes (`maxSequenceBytes`, command
+    /// byte included), which marks a sequence as too long.
+    func apcBufferLimit(command: UInt8) -> Int {
+        if command == 0x47, let terminal, terminal.options.kittyGraphicsEnabled {  // G
+            return terminal.kittyGraphicsState.maxSequenceBytes + 1
+        }
+        return 1
+    }
+
     func dispatchApc(command: UInt8, content: ArraySlice<UInt8>) {
         guard let terminal = terminal else {
             apcHandlerFallback(command, content)
@@ -862,23 +875,42 @@ public class EscapeSequenceParser {
                 }
             case .oscPut:
                 var j = i
-                while j < end {
-                    let c = data [j]
-                    if c == ControlCodes.BEL || c == ControlCodes.CAN || c == ControlCodes.ESC {
-                        break
-                    } else if c >= 0x20 {
-                        if currentState == .apcString {
+                if currentState == .apcString {
+                    // Only the bytes something reads are kept: the command
+                    // byte always, the content only up to apcBufferLimit.
+                    var limit = apc.isEmpty ? 1 : apcBufferLimit(command: apc[apc.startIndex])
+                    while j < end {
+                        let c = data [j]
+                        if c == ControlCodes.BEL || c == ControlCodes.CAN || c == ControlCodes.ESC {
+                            break
+                        } else if c >= 0x20 && apc.count < limit {
                             apc.append (c)
-                        } else {
+                            if apc.count == 1 {
+                                limit = apcBufferLimit(command: c)
+                            }
+                        }
+                        j += 1
+                    }
+                } else {
+                    while j < end {
+                        let c = data [j]
+                        if c == ControlCodes.BEL || c == ControlCodes.CAN || c == ControlCodes.ESC {
+                            break
+                        } else if c >= 0x20 {
                             osc.append (c)
                         }
+                        j += 1
                     }
-                    j += 1
                 }
                 i = j - 1
             case .oscEnd:
                 if currentState == .apcString {
-                    if apc.count != 0 && code != ControlCodes.CAN && code != ControlCodes.SUB {
+                    if let terminal, apc.count > terminal.kittyGraphicsState.maxSequenceBytes {
+                        // Over the limit (apcBufferLimit keeps one byte more
+                        // than it allows): the sequence is dropped, and with it
+                        // any chunked transmission it continued.
+                        terminal.kittyGraphicsState.pending = nil
+                    } else if apc.count != 0 && code != ControlCodes.CAN && code != ControlCodes.SUB {
                         let command = apc[apc.startIndex]
                         let content = apc.count > 1 ? apc[(apc.startIndex+1)...] : ArraySlice<UInt8>()
                         dispatchApc(command: command, content: content)

@@ -107,6 +107,29 @@ public struct TerminalOptions {
     /// Initial state for terminal-wg left and right arrow swapping. The default
     /// is false, so the host or terminal application must opt in.
     public var initialBidiArrowKeySwap: Bool
+    /// Whether kitty graphics protocol sequences (`APC G ... ST`) are handled.
+    /// When false they are consumed and ignored, as by a terminal that does not
+    /// implement the protocol: no reply, nothing decoded or stored, and the
+    /// parser does not buffer their contents. Defaults to true.
+    ///
+    /// Read for every sequence, so a host can change it through
+    /// `Terminal.options` at any time; images already stored are kept.
+    public var kittyGraphicsEnabled: Bool
+    /// Whether kitty graphics may use the *local* transmission media: `t=f` (a
+    /// file path), `t=t` (a temporary file, deleted after reading) and `t=s` (a
+    /// POSIX shared-memory object, unlinked after reading). These name objects
+    /// on the machine that runs the terminal, so they are only meaningful when
+    /// the program writing to the terminal runs there too. A remote program
+    /// (over SSH, a serial line, a container) could otherwise make the host
+    /// read, display or delete its files and learn from the replies whether a
+    /// path exists.
+    ///
+    /// Defaults to false: such transmissions, and queries (`a=q`) for them,
+    /// get the same `ENOTSUP: unsupported transmission` reply for every path,
+    /// and the path is never opened, inspected or removed. Direct transmission
+    /// (`t=d`, the data inside the sequence) is unaffected. Read for every
+    /// sequence, like ``kittyGraphicsEnabled``.
+    public var allowKittyLocalFileTransmission: Bool
 
     /// Default options
     public static let `default` = TerminalOptions.init(cols: 80,
@@ -123,14 +146,18 @@ public struct TerminalOptions {
                                                        regionalIndicatorWidth: .wide,
                                                        initialBidiState: .default,
                                                        maximumBidiParagraphRows: 500,
-                                                       initialBidiArrowKeySwap: false)
+                                                       initialBidiArrowKeySwap: false,
+                                                       kittyGraphicsEnabled: true,
+                                                       allowKittyLocalFileTransmission: false)
 
   public init(cols: Int = Self.default.cols, rows: Int = Self.default.rows, convertEol: Bool = Self.default.convertEol, termName: String = Self.default.termName, cursorStyle: CursorStyle = Self.default.cursorStyle, screenReaderMode: Bool = Self.default.screenReaderMode, scrollback: Int = Self.default.scrollback, tabStopWidth: Int = Self.default.tabStopWidth,
               enableSixelReported: Bool = Self.default.enableSixelReported, kittyImageCacheLimitBytes: Int = Self.default.kittyImageCacheLimitBytes, ansi256PaletteStrategy: Ansi256PaletteStrategy = Self.default.ansi256PaletteStrategy,
               regionalIndicatorWidth: RegionalIndicatorWidth = Self.default.regionalIndicatorWidth,
               initialBidiState: BidiPresentationState = Self.default.initialBidiState,
               maximumBidiParagraphRows: Int = Self.default.maximumBidiParagraphRows,
-              initialBidiArrowKeySwap: Bool = Self.default.initialBidiArrowKeySwap) {
+              initialBidiArrowKeySwap: Bool = Self.default.initialBidiArrowKeySwap,
+              kittyGraphicsEnabled: Bool = Self.default.kittyGraphicsEnabled,
+              allowKittyLocalFileTransmission: Bool = Self.default.allowKittyLocalFileTransmission) {
         self.cols = cols
         self.rows = rows
         self.convertEol = convertEol
@@ -146,5 +173,7 @@ public struct TerminalOptions {
         self.initialBidiState = initialBidiState
         self.maximumBidiParagraphRows = max(1, maximumBidiParagraphRows)
         self.initialBidiArrowKeySwap = initialBidiArrowKeySwap
+        self.kittyGraphicsEnabled = kittyGraphicsEnabled
+        self.allowKittyLocalFileTransmission = allowKittyLocalFileTransmission
     }
 }

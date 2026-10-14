@@ -143,20 +143,51 @@ final class KittyGraphicsState {
     var placementsByKey: [KittyPlacementKey: KittyPlacementRecord] = [:]
     var totalImageBytes: Int = 0
     var nextImageAccessTick: UInt64 = 1
+    /// The most base64 one transmission may carry, single or chunked
+    /// (`Terminal.kittyMaxEncodedPayloadBytes`; lowered by tests).
+    var maxEncodedPayloadBytes = Terminal.kittyMaxEncodedPayloadBytes
+    /// The most the parser buffers of one `APC G` sequence: a whole payload
+    /// plus room for the control keys. A longer sequence is dropped.
+    var maxSequenceBytes: Int { maxEncodedPayloadBytes + 4096 }
 }
 
 extension Terminal {
     private static let kittyMaxImageBytes = 400 * 1024 * 1024
     private static let kittyMaxImageDimension = 10000
     private static let kittyMaxImageCacheBytes = 4 * 1024 * 1024 * 1024
+    /// The most base64 one transmission may carry, single or chunked: the
+    /// encoding of `kittyMaxImageBytes`, the most it may decode to.
+    static let kittyMaxEncodedPayloadBytes = (kittyMaxImageBytes + 2) / 3 * 4
+    /// The reply to a transmission medium the terminal does not take: an
+    /// unknown one, or a local one (`t=f`, `t=t`, `t=s`) the host has not
+    /// allowed. The same for every path, so it says nothing about the path.
+    static let kittyUnsupportedTransmission = "ENOTSUP: unsupported transmission"
+
+    /// Whether `medium` names an object on the local machine rather than
+    /// carrying the data in the sequence.
+    static func isKittyLocalMedium(_ medium: Character) -> Bool {
+        medium == "f" || medium == "t" || medium == "s"
+    }
 
     func handleKittyGraphics(_ data: ArraySlice<UInt8>) {
+        guard options.kittyGraphicsEnabled else {
+            kittyGraphicsState.pending = nil
+            return
+        }
         guard let (control, payload) = parseKittyGraphicsControl(data) else {
             return
         }
 
         if control.action == "d" || control.action == "D" {
             kittyGraphicsState.pending = nil
+        }
+
+        let buffered = kittyGraphicsState.pending?.base64Payload.count ?? 0
+        if buffered + payload.count > kittyGraphicsState.maxEncodedPayloadBytes {
+            let first = kittyGraphicsState.pending?.control ?? control
+            kittyGraphicsState.pending = nil
+            sendKittyError(control: first, message: "EFBIG: too much data")
+            return
         }
 
         if control.more == 1 {
@@ -309,6 +340,10 @@ extension Terminal {
     }
 
     private func handleKittyQuery(control: KittyGraphicsControl, base64Payload: [UInt8]) {
+        if Terminal.isKittyLocalMedium(control.transmission) && !options.allowKittyLocalFileTransmission {
+            sendKittyError(control: control, message: Terminal.kittyUnsupportedTransmission)
+            return
+        }
         guard decodeKittyPayload(control: control, base64Payload: base64Payload) != nil else {
             sendKittyError(control: control, message: "EINVAL: bad payload")
             return
@@ -628,6 +663,12 @@ extension Terminal {
     }
 
     private func loadKittyPayload(control: KittyGraphicsControl, base64Payload: [UInt8]) -> (payload: KittyGraphicsPayload?, errorMessage: String?) {
+        // Refused before the payload (the path or object name) is even
+        // decoded: nothing on this machine is opened, inspected or removed,
+        // and the reply is the same whatever the payload names.
+        if Terminal.isKittyLocalMedium(control.transmission) && !options.allowKittyLocalFileTransmission {
+            return (nil, Terminal.kittyUnsupportedTransmission)
+        }
         switch control.transmission {
         case "d":
             guard let payload = decodeKittyPayload(control: control, base64Payload: base64Payload) else {
@@ -641,7 +682,7 @@ extension Terminal {
         case "s":
             return loadKittySharedMemoryPayload(control: control, base64Payload: base64Payload)
         default:
-            return (nil, "ENOTSUP: unsupported transmission")
+            return (nil, Terminal.kittyUnsupportedTransmission)
         }
     }
 
@@ -703,7 +744,7 @@ extension Terminal {
         guard compression == "z" else {
             return nil
         }
-        guard let inflated = decompressZlib(data), inflated.count <= Terminal.kittyMaxImageBytes else {
+        guard let inflated = Terminal.inflateKittyData(data, limit: Terminal.kittyMaxImageBytes) else {
             return nil
         }
         return inflated
@@ -1877,8 +1918,40 @@ extension Terminal {
         return col >= left && col <= right
     }
 
-    private func decompressZlib(_ data: Data) -> Data? {
+    /// Inflates `o=z` data: zlib (RFC 1950, what the protocol specifies: a
+    /// 2-byte header, deflate, an Adler-32 trailer, checked), or a bare
+    /// deflate stream (RFC 1951, what this decoder took before). Nil if the
+    /// data is malformed or truncated, or would inflate past `limit` bytes —
+    /// checked as it inflates, so a small payload cannot make it allocate
+    /// more than `limit`.
+    static func inflateKittyData(_ data: Data, limit: Int) -> Data? {
+        let bytes = [UInt8](data)
+        // RFC 1950 header: CM 8 (deflate), CINFO <= 7, FCHECK, no preset
+        // dictionary (FDICT, which kitty's clients never set). Apple's
+        // decoder takes bare deflate and swallows whatever follows the
+        // stream's end, so the header and the Adler-32 trailer are split
+        // off here.
+        if bytes.count >= 2 + 4, bytes[0] & 0x0f == 8, bytes[0] >> 4 <= 7,
+           (UInt16(bytes[0]) << 8 | UInt16(bytes[1])) % 31 == 0, bytes[1] & 0x20 == 0 {
+            let n = bytes.count
+            let checksum = UInt32(bytes[n - 4]) << 24 | UInt32(bytes[n - 3]) << 16
+                | UInt32(bytes[n - 2]) << 8 | UInt32(bytes[n - 1])
+            if let output = inflateDeflate(bytes[2..<(n - 4)], limit: limit), adler32(output) == checksum {
+                return output
+            }
+            // A bare deflate stream can start with bytes that pass the
+            // header check (a stored block with nonzero padding bits).
+        }
+        return inflateDeflate(bytes[...], limit: limit)
+    }
+
+    /// Inflates a bare deflate stream (RFC 1951) of at most `limit` bytes.
+    private static func inflateDeflate(_ body: ArraySlice<UInt8>, limit: Int) -> Data? {
 #if canImport(Compression)
+        guard !body.isEmpty else {
+            return nil
+        }
+
         let dummyDst = UnsafeMutablePointer<UInt8>.allocate(capacity: 1)
         let dummySrc = UnsafeMutablePointer<UInt8>.allocate(capacity: 1)
         var stream = compression_stream(dst_ptr: dummyDst,
@@ -1902,23 +1975,29 @@ extension Terminal {
         let dstSize = 64 * 1024
         var dstBuffer = [UInt8](repeating: 0, count: dstSize)
 
-        return data.withUnsafeBytes { srcPtr -> Data? in
-            guard let srcBase = srcPtr.bindMemory(to: UInt8.self).baseAddress else {
+        let inflated = body.withUnsafeBufferPointer { srcPtr -> Data? in
+            guard let srcBase = srcPtr.baseAddress else {
                 return nil
             }
             stream.src_ptr = srcBase
-            stream.src_size = data.count
+            stream.src_size = srcPtr.count
 
             while true {
+                let srcBefore = stream.src_size
+                // The whole input is here: FINALIZE, so a truncated stream
+                // is an error rather than a request for more input.
                 let status = dstBuffer.withUnsafeMutableBytes { dstPtr -> compression_status in
                     guard let dstBase = dstPtr.bindMemory(to: UInt8.self).baseAddress else {
                         return COMPRESSION_STATUS_ERROR
                     }
                     stream.dst_ptr = dstBase
                     stream.dst_size = dstSize
-                    return compression_stream_process(&stream, 0)
+                    return compression_stream_process(&stream, Int32(bitPattern: COMPRESSION_STREAM_FINALIZE.rawValue))
                 }
                 let produced = dstSize - stream.dst_size
+                if produced > limit - output.count {
+                    return nil
+                }
                 if produced > 0 {
                     output.append(dstBuffer, count: produced)
                 }
@@ -1927,14 +2006,39 @@ extension Terminal {
                 case COMPRESSION_STATUS_END:
                     return output
                 case COMPRESSION_STATUS_OK:
+                    // No input taken and no output made: no progress is
+                    // possible (the decoder would spin forever).
+                    if produced == 0 && stream.src_size == srcBefore {
+                        return nil
+                    }
                     continue
                 default:
                     return nil
                 }
             }
         }
+        return inflated
 #else
         return nil
 #endif
+    }
+
+    static func adler32(_ data: Data) -> UInt32 {
+        var a: UInt32 = 1
+        var b: UInt32 = 0
+        // 5552 bytes is the most that can be summed before the modulo
+        // without overflowing 32 bits (zlib's NMAX).
+        var index = data.startIndex
+        while index < data.endIndex {
+            let end = data.index(index, offsetBy: min(5552, data.endIndex - index))
+            for byte in data[index..<end] {
+                a &+= UInt32(byte)
+                b &+= a
+            }
+            a %= 65521
+            b %= 65521
+            index = end
+        }
+        return b << 16 | a
     }
 }
