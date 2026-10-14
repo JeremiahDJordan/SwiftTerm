@@ -3275,7 +3275,8 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     public func resetFontSize ()
     {
         // Recompute metrics and redraw, but unlike the font setter do not
-        // clear the active selection
+        // clear the active selection (a change of grid still clears it, as
+        // any resize does: its coordinates no longer apply)
         fontSet = FontSet (font: FontSet.defaultFont)
         resetFont ()
     }

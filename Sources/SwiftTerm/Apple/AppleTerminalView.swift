@@ -298,21 +298,43 @@ extension TerminalView {
     {
         resetCaches()
         self.cellDimension = computeFontDimensions ()
-        if (frame.width > 0) && (frame.height > 0) {
-            // Use getEffectiveWidth so the scroller's reserved width is taken
-            // into account, matching processSizeChange(). Computing columns from
-            // the raw frame width here would over-count by the scroller width,
-            // so zooming the font in and back out would drift the column count.
-            let newCols = Int(getEffectiveWidth(size: frame.size) / cellDimension.width)
-            let newRows = Int(frame.height / cellDimension.height)
-            resize(cols: newCols, rows: newRows)
+        let regrid = (frame.width > 0) && (frame.height > 0)
+        if regrid {
+            // Re-grid through processSizeChange(), the path a frame change
+            // takes. It uses getEffectiveWidth, so the scroller's reserved
+            // width is taken into account and zooming the font in and back
+            // out does not drift the column count. Not the public
+            // resize(cols:rows:): that also soft-resets the emulator (DECSTR),
+            // so a font change dropped a running program's modes (DECCKM, the
+            // keypad mode, insert and origin mode, a hidden cursor, the
+            // current attributes). Margins still reset when the grid changes,
+            // as on any resize (Buffer.resize).
+            if !processSizeChange(newSize: frame.size) {
+                // Same grid, new cell size: the scroll content still has to
+                // follow the cell dimensions, and the delegate still hears
+                // about it, as before (the cell size in pixels changed; a
+                // LocalProcessTerminalView passes it to the PTY). Upstream's
+                // resize(cols:rows:) reported on every font change too, so a
+                // delegate must not set the font again from sizeChanged.
+                updateScroller()
+                terminalDelegate?.sizeChanged(source: self, newCols: terminal.cols, newRows: terminal.rows)
+            }
         }
         updateCaretView()
-        
+        if regrid {
+            // The caret's origin is in cells too (as after a layout resize).
+            updateCursorPosition()
+            // Every glyph moved: repaint all rows through the regular display
+            // path (which also drives the Metal renderer and accessibility),
+            // as the soft reset's colour reset used to cause.
+            terminal.updateFullScreen()
+            queuePendingDisplay()
+        }
+
         #if os(macOS)
         needsDisplay = true
         #else
-        setNeedsDisplay(frame)
+        setNeedsDisplay(bounds)
         #endif
     }
     
@@ -387,8 +409,10 @@ extension TerminalView {
         if newSize.width == 0 && newSize.height == 0 {
             return false
         }
-        let newRows = Int (newSize.height / cellDimension.height)
-        let newCols = Int (getEffectiveWidth (size: newSize) / cellDimension.width)
+        // Clamped as Terminal.resize clamps them, so a grid below the minimum
+        // compares equal to the terminal's and is reported as it really is.
+        let newRows = max (Int (newSize.height / cellDimension.height), terminal.MINIMUM_ROWS)
+        let newCols = max (Int (getEffectiveWidth (size: newSize) / cellDimension.width), terminal.MINIMUM_COLS)
         
         if newCols != terminal.cols || newRows != terminal.rows {
             selection.active = false
