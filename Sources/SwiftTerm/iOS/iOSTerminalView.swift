@@ -390,6 +390,7 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
         setupLinkReportingInteractions()
         setupAccessoryView ()
         setupTextBlinking()
+        setupDisplayScaleTracking()
         didFinishSetup = true
     }
 
@@ -1950,13 +1951,61 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
         setNeedsDisplay(bounds)
     }
 
+    /// The scale of the display this view is on: cells snap to its pixel
+    /// grid (computeFontDimensions) and lines are drawn for it. Not
+    /// UIScreen.main.scale, which is the device's main screen, not
+    /// necessarily this view's (an external display, a second built-in
+    /// display). A view outside a window has its trait environment's default.
     func backingScaleFactor () -> CGFloat
     {
         #if os(visionOS)
         1.0
         #else
-        UIScreen.main.scale
+        let scale = traitCollection.displayScale
+        if scale > 0 {
+            return max(scale, 1)
+        }
+        return max(window?.windowScene?.screen.scale ?? 1, 1)
         #endif
+    }
+
+    func setupDisplayScaleTracking ()
+    {
+        #if !os(visionOS)
+        if #available(iOS 17.0, *) {
+            registerForTraitChanges([UITraitDisplayScale.self], action: #selector(displayScaleDidChange))
+        }
+        #endif
+    }
+
+    #if !os(visionOS)
+    // Before iOS 17 there is no trait registration: follow the scale here.
+    open override func traitCollectionDidChange (_ previousTraitCollection: UITraitCollection?)
+    {
+        super.traitCollectionDidChange (previousTraitCollection)
+        if #available(iOS 17.0, *) {
+            return
+        }
+        if didFinishSetup && previousTraitCollection?.displayScale != traitCollection.displayScale {
+            displayScaleDidChange ()
+        }
+    }
+    #endif
+
+    /// The view moved to a display with another scale: cells snap to a
+    /// different pixel grid, so re-measure them and, if they changed, re-grid
+    /// as a font change does (without resetting the emulator).
+    @objc func displayScaleDidChange ()
+    {
+        if computeFontDimensions () != cellDimension {
+            resetFont ()
+        } else {
+            // Same cells, drawn for the new scale (this path also drives the
+            // Metal renderer).
+            terminal.updateFullScreen ()
+            queuePendingDisplay ()
+            setNeedsDisplay (bounds)
+        }
     }
     
     override public func draw (_ dirtyRect: CGRect) {
