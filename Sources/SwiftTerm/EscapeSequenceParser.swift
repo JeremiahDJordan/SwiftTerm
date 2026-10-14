@@ -356,6 +356,16 @@ public class EscapeSequenceParser {
 
     /// Sequences beyond this limit are dropped instead of growing parser state without bound.
     static let maximumParameterCount = 24
+
+    /// Intermediate and private-marker bytes kept for one sequence (real ones
+    /// have one or two). A sequence with more is dropped, like one with too
+    /// many parameters, instead of holding every byte a program sends.
+    static let maximumCollectBytes = 16
+
+    /// Set when an OSC string grew past ``TerminalOptions/maximumOscBytes``
+    /// and a byte was not kept: the string is dropped when it ends, even if
+    /// the option was raised in the meantime.
+    var oscOverflowed = false
     let table: TransitionTable
     
     init (terminal: Terminal? = nil)
@@ -606,6 +616,14 @@ public class EscapeSequenceParser {
         return 1
     }
 
+    /// How many bytes of an OSC string are buffered: one more than the
+    /// longest dispatched (``TerminalOptions/maximumOscBytes``), which marks
+    /// a string as too long. Read as each run of content arrives.
+    func oscBufferLimit() -> Int {
+        let maximum = terminal?.options.maximumOscBytes ?? TerminalOptions.default.maximumOscBytes
+        return max(0, min(maximum, Int.max - 1)) + 1
+    }
+
     func dispatchApc(command: UInt8, content: ArraySlice<UInt8>) {
         guard let terminal = terminal else {
             apcHandlerFallback(command, content)
@@ -626,7 +644,9 @@ public class EscapeSequenceParser {
         if collect == [0x24] && code == 0x71 {  // "$q"
             return Terminal.DECRQSS(terminal: terminal)
         } else if collect.isEmpty && code == 0x71 {  // "q"
-            return SixelDcsHandler(terminal: terminal)
+            // Off, no handler: the string is consumed unbuffered, as for any
+            // DCS nothing handles.
+            return terminal.options.sixelEnabled ? SixelDcsHandler(terminal: terminal) : nil
         }
         return nil
     }
@@ -654,6 +674,7 @@ public class EscapeSequenceParser {
     {
         currentState = initialState
         _osc = []
+        oscOverflowed = false
         _apc = []
         _pars = [0]
         _parsTxt = []
@@ -819,23 +840,34 @@ public class EscapeSequenceParser {
                         to: pars [pars.count - 1])
                 }
             case .escDispatch:
-                dispatchEsc(collect: collect, code: code)
+                if !parameterLimitExceeded {
+                    dispatchEsc(collect: collect, code: code)
+                }
             case .collect:
-                collect.append (code)
+                if collect.count < EscapeSequenceParser.maximumCollectBytes {
+                    collect.append (code)
+                } else {
+                    parameterLimitExceeded = true
+                }
             case .clear:
                 if ~print != 0 {
                     printHandler (data [print..<i])
                     print = -1
                 }
                 osc = []
+                oscOverflowed = false
                 apc = []
                 pars = [0]
                 parsTxt = []
                 collect = []
                 parameterLimitExceeded = false
                 dcs = -1
+                // A handler left by a DCS that was aborted (SUB) is
+                // released, never handed a later sequence's content.
+                dcsHandler = nil
                 printStateReset()
             case .dcsHook:
+                dcsHandler = nil
                 if !parameterLimitExceeded,
                    let handler = dispatchDcs(collect: collect, code: code, pars: pars) {
                     dcsHandler = handler
@@ -845,16 +877,21 @@ public class EscapeSequenceParser {
                 dcs = (~dcs != 0) ? dcs : i
             case .dcsUnhook:
                 if let d = dcsHandler {
+                    // The content since this call began (none when the
+                    // terminator arrives in a call of its own: the rest was
+                    // put at the end of the previous one). The handler is
+                    // unhooked either way.
                     if ~dcs != 0 {
                         d.put (data: data[dcs..<i])
-                        d.unhook ()
-                        dcsHandler = nil
                     }
+                    d.unhook ()
+                    dcsHandler = nil
                 }
                 if code == 0x1b {
                     transition |= ParserState.escape.rawValue
                 }
                 osc = []
+                oscOverflowed = false
                 apc = []
                 pars = [0]
                 parsTxt = []
@@ -872,6 +909,7 @@ public class EscapeSequenceParser {
                     apc = []
                 } else {
                     osc = []
+                    oscOverflowed = false
                 }
             case .oscPut:
                 var j = i
@@ -892,12 +930,19 @@ public class EscapeSequenceParser {
                         j += 1
                     }
                 } else {
+                    // Held up to oscBufferLimit: a longer string is dropped
+                    // when it ends (below), and holds no more than that.
+                    let limit = oscBufferLimit()
                     while j < end {
                         let c = data [j]
                         if c == ControlCodes.BEL || c == ControlCodes.CAN || c == ControlCodes.ESC {
                             break
                         } else if c >= 0x20 {
-                            osc.append (c)
+                            if osc.count < limit {
+                                osc.append (c)
+                            } else {
+                                oscOverflowed = true
+                            }
                         }
                         j += 1
                     }
@@ -915,6 +960,9 @@ public class EscapeSequenceParser {
                         let content = apc.count > 1 ? apc[(apc.startIndex+1)...] : ArraySlice<UInt8>()
                         dispatchApc(command: command, content: content)
                     }
+                } else if oscOverflowed || osc.count >= oscBufferLimit() {
+                    // Longer than maximumOscBytes: dropped, not dispatched.
+                    terminal?.log ("SwiftTerm: OSC string longer than \(oscBufferLimit() - 1) bytes dropped")
                 } else {
                     if osc.count != 0 && code != ControlCodes.CAN && code != ControlCodes.SUB {
                         let oscCode: Int?
@@ -937,6 +985,7 @@ public class EscapeSequenceParser {
                     transition |= ParserState.escape.rawValue
                 }
                 osc = []
+                oscOverflowed = false
                 apc = []
                 pars = [0]
                 parsTxt = []
@@ -945,7 +994,16 @@ public class EscapeSequenceParser {
                 dcs = -1
                 printStateReset()
             }
-            currentState = ParserState (rawValue: transition & 15)!
+            let nextState = ParserState (rawValue: transition & 15)!
+            if currentState == .dcsPassthrough && nextState != .dcsPassthrough && dcsHandler != nil {
+                // Left without a terminator (SUB, or a C1 control that starts
+                // something else): the sequence is abandoned, and the handler
+                // and what it holds are released now, not when the next
+                // sequence starts.
+                dcsHandler = nil
+                dcs = -1
+            }
+            currentState = nextState
             i += 1
         }
         // push leftover pushable buffers to terminal

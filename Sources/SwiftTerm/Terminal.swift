@@ -512,6 +512,9 @@ open class Terminal {
     
     public var parser: EscapeSequenceParser
     var kittyGraphicsState = KittyGraphicsState()
+    /// The most a sixel sequence (`DCS q`) may hold; a longer one is dropped
+    /// (`SixelDcsHandler.defaultMaxSequenceBytes`; lowered by tests).
+    var sixelMaxSequenceBytes = SixelDcsHandler.defaultMaxSequenceBytes
     var kittyPlacementContext: KittyPlacementContext?
     
     var refreshStart = Int.max
@@ -1085,7 +1088,12 @@ open class Terminal {
     //   Request Status String (DECRQSS), VT420 and up.
     // Response: DECRPSS (https://vt100.net/docs/vt510-rm/DECRPSS.html)
     class DECRQSS : DcsHandler {
+        /// The longest request kept. Every request this answers is at most
+        /// two bytes; a longer one is answered as invalid without being held.
+        static let maxRequestBytes = 64
         var data: [UInt8]
+        /// Set when the request was longer than `maxRequestBytes`.
+        var overflowed = false
         unowned var terminal: Terminal
 
         public init (terminal: Terminal)
@@ -1097,18 +1105,21 @@ open class Terminal {
         func hook (collect: cstring, parameters: [Int],  flag: UInt8)
         {
             data = []
+            overflowed = false
         }
         
         func put (data : ArraySlice<UInt8>)
         {
-            for x in data {
-                self.data.append(x)
+            let room = DECRQSS.maxRequestBytes - self.data.count
+            if data.count > room {
+                overflowed = true
             }
+            self.data.append(contentsOf: data.prefix(max(0, room)))
         }
         
         func unhook ()
         {
-            let newData = String (bytes: data, encoding: .ascii)
+            let newData = overflowed ? nil : String (bytes: data, encoding: .ascii)
             var ok = 1 // 0 means the request is valid according to docs, but tests expect 0?
             var result: String
             switch (newData) {

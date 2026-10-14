@@ -17,6 +17,31 @@ final class KittyLocalTransmissionPolicyTests {
     @_silgen_name("shm_open")
     private static func swiftShmOpen(_ name: UnsafePointer<CChar>, _ oflag: Int32, _ mode: mode_t) -> Int32
 
+    // `shm_open` is variadic in C (the mode follows `...`), and Swift cannot
+    // call a variadic C function. The binding above is fine without O_CREAT,
+    // where the mode is not read. To create, the mode has to arrive where
+    // `va_arg` reads it: on Apple arm64 variadic arguments are passed on the
+    // stack, so eight register-sized arguments fill x0-x7 and the mode goes
+    // to the first stack slot; on x86_64 they are passed like any other.
+    // The arm64 form calls the function through `dlsym`, so the module does
+    // not declare `shm_open` with two different types.
+    // (With the plain binding the object got whatever was on the stack as its
+    // mode, sometimes without read permission, and these tests failed or
+    // passed with the code layout; `fchmod` cannot fix it up: Darwin refuses
+    // it on shared memory with EINVAL.)
+    #if arch(arm64)
+    private typealias ShmCreate = @convention(c) (UnsafePointer<CChar>, Int32, Int, Int, Int, Int, Int, Int, Int) -> Int32
+    private static func swiftShmCreate(_ name: UnsafePointer<CChar>, _ oflag: Int32, _ mode: mode_t) -> Int32 {
+        guard let symbol = dlsym(UnsafeMutableRawPointer(bitPattern: -2), "shm_open") else { return -1 }  // RTLD_DEFAULT
+        let create = unsafeBitCast(symbol, to: ShmCreate.self)
+        return create(name, oflag, 0, 0, 0, 0, 0, 0, Int(mode))
+    }
+    #else
+    private static func swiftShmCreate(_ name: UnsafePointer<CChar>, _ oflag: Int32, _ mode: mode_t) -> Int32 {
+        swiftShmOpen(name, oflag, mode)
+    }
+    #endif
+
     /// The refusal, exactly as the terminal sends it for image id 7.
     private static let refusal = "\u{1b}_Gi=7;ENOTSUP: unsupported transmission\u{1b}\\"
 
@@ -49,10 +74,12 @@ final class KittyLocalTransmissionPolicyTests {
     }
 
     private static func createSharedMemory(name: String, bytes: [UInt8]) -> Bool {
-        let fd = name.withCString { swiftShmOpen($0, O_CREAT | O_EXCL | O_RDWR, 0o600) }
+        let fd = name.withCString { swiftShmCreate($0, O_CREAT | O_EXCL | O_RDWR, 0o600) }
         guard fd >= 0 else { return false }
         defer { close(fd) }
-        guard ftruncate(fd, off_t(bytes.count)) == 0,
+        var st = stat()
+        guard fstat(fd, &st) == 0, st.st_mode & 0o600 == 0o600,
+              ftruncate(fd, off_t(bytes.count)) == 0,
               let map = mmap(nil, bytes.count, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0),
               map != MAP_FAILED else {
             _ = name.withCString { shm_unlink($0) }
@@ -70,11 +97,18 @@ final class KittyLocalTransmissionPolicyTests {
         return true
     }
 
+    /// Darwin (macOS and the iOS Simulator) always has POSIX shared memory,
+    /// so there the shm tests always run, and a helper that cannot create an
+    /// object fails them instead of skipping them.
     private static func sharedMemoryAvailable() -> Bool {
+        #if canImport(Darwin)
+        return true
+        #else
         let name = "/st-kitty-\(UInt32.random(in: 0...UInt32.max))"
         guard createSharedMemory(name: name, bytes: [0]) else { return false }
         _ = name.withCString { shm_unlink($0) }
         return true
+        #endif
     }
 
     // MARK: Local media refused by default

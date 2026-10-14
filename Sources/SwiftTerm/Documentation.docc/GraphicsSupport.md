@@ -33,6 +33,15 @@ Sixel support is advertised to querying applications when
 ``TerminalOptions/enableSixelReported`` is `true` (the default). Set it to `false`
 if you want to hide Sixel support from applications.
 
+Advertising does not decide whether images are decoded: an application can
+send Sixel data without asking. Set ``TerminalOptions/sixelEnabled`` to `false`
+(the default is `true`) to consume Sixel sequences without buffering or
+decoding them, as a terminal without Sixel does. When it is on, the decoder is
+bounded: a sequence longer than 64 MiB is dropped, numbers stop growing at
+1,000,000, a repeat count does not loop, images are cropped to 10,000 pixels
+each way and to 16,777,216 pixels in all (64 MiB of RGBA), drawing stops after
+four times the image's area, and at most 1,024 colour registers are defined.
+
 ## iTerm2 Inline Images
 
 iTerm2's [inline image protocol](https://iterm2.com/documentation-images.html)

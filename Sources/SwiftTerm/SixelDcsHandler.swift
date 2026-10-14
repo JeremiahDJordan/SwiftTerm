@@ -9,8 +9,47 @@ import Foundation
 // DCS handler for sixel sequences, collects the image and
 // then calls into the front-end to attach the parsed image
 // into its internal representation to display the image.
+//
+// Everything here comes from the program writing to the terminal, which may
+// be remote, so the decoder is bounded whatever it is sent:
+// - the sequence is held up to `Terminal.sixelMaxSequenceBytes` (a longer one
+//   is released at once and dropped without an image);
+// - numbers stop growing at `maxNumber` instead of overflowing;
+// - a repeat moves the cursor in one step instead of looping over its count;
+// - an image is cropped to `maxDimension` pixels each way, and its height
+//   further so that its area stays within `maxPixels` (the pixel buffer is at
+//   most `maxPixels * 4` bytes);
+// - the second pass draws at most `drawPasses` times the image's area;
+// - only `maxColorArguments` numbers of a colour command are kept, and only
+//   `maxColorRegisters` palette entries can be defined.
+// So the time taken is linear in the sequence's length (plus the bounded
+// drawing), and the memory is the sequence plus at most `maxPixels * 4`.
 class SixelDcsHandler : DcsHandler {
+    /// The longest sixel sequence held by default (`Terminal.sixelMaxSequenceBytes`).
+    static let defaultMaxSequenceBytes = 64 * 1024 * 1024
+    /// The widest and tallest image decoded, in pixels; the rest is cropped.
+    static let maxDimension = 10_000
+    /// The largest image area decoded, in pixels (64 MiB of RGBA); a taller
+    /// image is cropped at the row where it would pass this.
+    static let maxPixels = 4096 * 4096
+    /// Colour registers that can be defined (`#Pc;Pu;Px;Py;Pz` with
+    /// `Pc` below this); a definition of a higher one is ignored.
+    static let maxColorRegisters = 1024
+    /// Numbers of a colour command kept: the register, the colour system and
+    /// three components. Further ones are read and dropped.
+    static let maxColorArguments = 5
+    /// Numbers (repeat counts, colour registers and values, raster
+    /// attributes) stop growing here: more digits leave the value at this.
+    static let maxNumber = 1_000_000
+    /// How many times the image's area the decoder draws before it stops
+    /// (a band can be drawn once per colour, so pixels are drawn more than
+    /// once; past this the image is kept as drawn so far).
+    static let drawPasses = 4
+
     var data: [UInt8]
+    /// Set when the sequence grew past `Terminal.sixelMaxSequenceBytes`: the
+    /// bytes held are released, the rest ignored, and no image is made.
+    var overflowed = false
     unowned var terminal: Terminal
 
     public init (terminal: Terminal)
@@ -22,12 +61,17 @@ class SixelDcsHandler : DcsHandler {
     func hook (collect: cstring, parameters: [Int],  flag: UInt8)
     {
         data = []
+        overflowed = false
     }
     
     func put (data : ArraySlice<UInt8>) {
-        for x in data {
-            self.data.append(x)
+        guard !overflowed else { return }
+        if data.count > terminal.sixelMaxSequenceBytes - self.data.count {
+            overflowed = true
+            self.data = []
+            return
         }
+        self.data.append(contentsOf: data)
     }
     
     private func nextInt(_ p: inout Int) -> Int? {
@@ -40,7 +84,8 @@ class SixelDcsHandler : DcsHandler {
             
             let digit = Int(c) - 48
             if let existing = result {
-                result = 10 * existing + digit
+                // Saturates: existing < maxNumber here, so this cannot overflow.
+                result = existing >= SixelDcsHandler.maxNumber ? existing : min(10 * existing + digit, SixelDcsHandler.maxNumber)
             } else {
                 result = digit
             }
@@ -50,7 +95,7 @@ class SixelDcsHandler : DcsHandler {
         return nil
     }
     
-    private func nextIntArray(_ p: inout Int) -> [Int] {
+    func nextIntArray(_ p: inout Int) -> [Int] {
         var result = [Int]()
         while p < data.count {
             // jump past semicolon delimiting integers
@@ -62,7 +107,9 @@ class SixelDcsHandler : DcsHandler {
                 break
             }
             
-            result.append(next)
+            if result.count < SixelDcsHandler.maxColorArguments {
+                result.append(next)
+            }
         }
         return result
     }
@@ -80,6 +127,10 @@ class SixelDcsHandler : DcsHandler {
     let poundChar: UInt8 = 0x23 /* # */
     
     func unhook () {
+        guard !overflowed else {
+            terminal.log ("SwiftTerm: sixel sequence longer than \(terminal.sixelMaxSequenceBytes) bytes dropped")
+            return
+        }
         var p = 0
         palette = [Int: UInt32]()
         x = 0
@@ -115,15 +166,25 @@ class SixelDcsHandler : DcsHandler {
         // A sixel stream is allowed to end without a carriage return ($) or
         // new-line (-).  Include the cursor's final position in that case so
         // the pixel buffer covers the last band that was scanned.
-        maxX = max(maxX, x)
+        maxX = min(max(maxX, x), SixelDcsHandler.maxDimension)
+        maxY = min(maxY, SixelDcsHandler.maxDimension)
+        if maxX > 0 {
+            maxY = min(maxY, SixelDcsHandler.maxPixels / maxX)
+        }
+        // Nothing to show (no sixel was drawn, or an empty sequence).
+        guard maxX > 0 && maxY > 0 else {
+            data = []
+            return
+        }
         
         // Allocate the buffer, and parse again, this time
         // plotting the data into the pixels buffer
         pixels = Array.init(repeating: 0, count: maxX*maxY*4)
+        drawBudget = maxX * maxY * SixelDcsHandler.drawPasses
         p = skipped
         x = 0
         y = 0
-        while p + 1 < data.count {
+        while p + 1 < data.count && drawBudget > 0 {
             if data[p] == poundChar {
                 p += 1 // jump past #
                 
@@ -154,6 +215,10 @@ class SixelDcsHandler : DcsHandler {
         }
 
         terminal.tdel?.createImageFromBitmap(source: terminal, bytes: &pixels, width: maxX, height: maxY)
+        // The parser releases the handler after this; let go of the buffers
+        // in case anything still holds it.
+        data = []
+        pixels = []
     }
     
     var palette = [Int: UInt32]()
@@ -162,6 +227,8 @@ class SixelDcsHandler : DcsHandler {
     var y = 0
     var maxX = 0
     var maxY = 0
+    /// Pixels the second pass may still draw (`drawPasses`).
+    var drawBudget = 0
     
     func pctToByte (_ pct: Int) -> Int {
         let pct = max (0, min (pct, 100))
@@ -171,6 +238,10 @@ class SixelDcsHandler : DcsHandler {
     private func updatePaletteEntry(_ color: [Int]) {
         // converts an input percentage 0..100 into a 0..255 value suitable to encode in RGB
 
+        // The palette holds at most `maxColorRegisters` entries.
+        guard color[0] < SixelDcsHandler.maxColorRegisters else {
+            return
+        }
         if color.count >= 5 && color[1] == 1 {
             let index = color[0]
             let hue = max (0, min (color[2], 360))
@@ -190,7 +261,10 @@ class SixelDcsHandler : DcsHandler {
     // read lines building up bitmap[y][x] with index into
     // or -1 to mean transparent
     private func sizePixels(_ p: inout Int, _ color: Int) {
-        func write(sixel: Int) {
+        // One sixel, `count` times: the bands it reaches, then the cursor,
+        // which stops at the widest image decoded (nothing is drawn past it).
+        func write(sixel: Int, count: Int) {
+            guard count > 0 else { return }
             if (sixel & 32) != 0 {
                 maxY = max (y&+6, maxY)
             }
@@ -209,7 +283,7 @@ class SixelDcsHandler : DcsHandler {
             if (sixel & 1) != 0 {
                 maxY = max (y&+1, maxY)
             }
-            x = x &+ 1
+            x = min(x &+ count, SixelDcsHandler.maxDimension)
         }
 
         var reps = 1
@@ -233,14 +307,12 @@ class SixelDcsHandler : DcsHandler {
                 
             // (hyphen or minus sign) character moves the sixel "cursor" to the "beginning of the next line
             case 45:
-                y = y &+ 6
+                y = min(y &+ 6, SixelDcsHandler.maxDimension)
                 maxX = max (maxX, x)
                 x = 0
                 
             case 63...126:
-                for _ in 0..<reps {
-                    write(sixel: Int(c) - 63)
-                }
+                write(sixel: Int(c) - 63, count: reps)
                 // back to not repeating
                 reps = 1
                 
@@ -271,21 +343,29 @@ class SixelDcsHandler : DcsHandler {
             rgba = transparent
         }
         
-        func write(sixel: Int) {
+        // One sixel, `count` times, drawn only inside the (cropped) image;
+        // the cursor moves as in `sizePixels`.
+        func write(sixel: Int, count: Int) {
+            guard count > 0 else { return }
+            let end = min(x &+ count, maxX)
             var k = 0
-            while k < 6 {
-                let on = (sixel & (1 << k)) != 0
-                if on {
-                    let s = ((y &+ k)*maxX &+ x) * 4
-                    pixels[s]   = UInt8 (rgba >> 24)
-                    pixels[s &+ 1] = UInt8 ((rgba >> 16) & 0xff)
-                    pixels[s &+ 2] = UInt8 ((rgba >> 8) & 0xff)
-                    pixels[s &+ 3] = UInt8 ((rgba) & 0xff)
+            while k < 6 && x < end && drawBudget > 0 {
+                let row = y &+ k
+                if (sixel & (1 << k)) != 0 && row < maxY {
+                    var s = (row * maxX + x) * 4
+                    for _ in x..<end {
+                        pixels[s]   = UInt8 (rgba >> 24)
+                        pixels[s &+ 1] = UInt8 ((rgba >> 16) & 0xff)
+                        pixels[s &+ 2] = UInt8 ((rgba >> 8) & 0xff)
+                        pixels[s &+ 3] = UInt8 ((rgba) & 0xff)
+                        s = s &+ 4
+                    }
+                    drawBudget -= end - x
                 }
                 k = k &+ 1
             }
             
-            x = x &+ 1
+            x = min(x &+ count, SixelDcsHandler.maxDimension)
         }
     
         var reps = 1
@@ -307,13 +387,11 @@ class SixelDcsHandler : DcsHandler {
                 
             // (hyphen or minus sign) character moves the sixel "cursor" to the "beginning of the next line
             case 45:
-                y += 6
+                y = min(y &+ 6, SixelDcsHandler.maxDimension)
                 x = 0
                 
             case 63...126:
-                for _ in 0..<reps {
-                    write(sixel: Int(c) - 63)
-                }
+                write(sixel: Int(c) - 63, count: reps)
                 // back to not repeating
                 reps = 1
                 

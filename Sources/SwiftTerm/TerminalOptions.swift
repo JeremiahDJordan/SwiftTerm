@@ -91,7 +91,9 @@ public struct TerminalOptions {
     public var scrollback: Int
     /// Default size of the tabs, defaults to 8
     public var tabStopWidth: Int
-    /// Whether to report that sixel support is present
+    /// Whether to report that sixel support is present (`4` in the DA1
+    /// answer). This only changes the answer; whether sixel images are
+    /// decoded is ``sixelEnabled``.
     public var enableSixelReported:Bool
     /// Maximum total bytes to keep for kitty image data; defaults to 320MB and is clamped to 4GB.
     public var kittyImageCacheLimitBytes: Int
@@ -130,6 +132,23 @@ public struct TerminalOptions {
     /// (`t=d`, the data inside the sequence) is unaffected. Read for every
     /// sequence, like ``kittyGraphicsEnabled``.
     public var allowKittyLocalFileTransmission: Bool
+    /// Whether sixel images (`DCS q ... ST`) are decoded. When false they are
+    /// consumed and ignored, as by a terminal without sixel: nothing is
+    /// buffered, decoded or drawn, and the output after the sequence is
+    /// handled as usual. Defaults to true. Set ``enableSixelReported`` too, so
+    /// programs that check DA1 do not send sixel at all.
+    ///
+    /// Read when each sequence starts, so a host can change it through
+    /// `Terminal.options` at any time; a sequence already started is decoded
+    /// as it was when it began.
+    public var sixelEnabled: Bool
+    /// The longest OSC string (`ESC ] … ST`, code and content) that is
+    /// handled, in bytes; defaults to 64 MiB. A longer one is dropped when
+    /// it ends, and no more than this is held while it arrives, so a program
+    /// cannot make the terminal buffer an endless string. Lower it if the
+    /// host needs no large OSC payloads (iTerm2 inline images and OSC 52
+    /// clipboard writes are the large ones). Read as the string arrives.
+    public var maximumOscBytes: Int
 
     /// Default options
     public static let `default` = TerminalOptions.init(cols: 80,
@@ -148,7 +167,9 @@ public struct TerminalOptions {
                                                        maximumBidiParagraphRows: 500,
                                                        initialBidiArrowKeySwap: false,
                                                        kittyGraphicsEnabled: true,
-                                                       allowKittyLocalFileTransmission: false)
+                                                       allowKittyLocalFileTransmission: false,
+                                                       sixelEnabled: true,
+                                                       maximumOscBytes: 64 * 1024 * 1024)
 
   public init(cols: Int = Self.default.cols, rows: Int = Self.default.rows, convertEol: Bool = Self.default.convertEol, termName: String = Self.default.termName, cursorStyle: CursorStyle = Self.default.cursorStyle, screenReaderMode: Bool = Self.default.screenReaderMode, scrollback: Int = Self.default.scrollback, tabStopWidth: Int = Self.default.tabStopWidth,
               enableSixelReported: Bool = Self.default.enableSixelReported, kittyImageCacheLimitBytes: Int = Self.default.kittyImageCacheLimitBytes, ansi256PaletteStrategy: Ansi256PaletteStrategy = Self.default.ansi256PaletteStrategy,
@@ -157,7 +178,9 @@ public struct TerminalOptions {
               maximumBidiParagraphRows: Int = Self.default.maximumBidiParagraphRows,
               initialBidiArrowKeySwap: Bool = Self.default.initialBidiArrowKeySwap,
               kittyGraphicsEnabled: Bool = Self.default.kittyGraphicsEnabled,
-              allowKittyLocalFileTransmission: Bool = Self.default.allowKittyLocalFileTransmission) {
+              allowKittyLocalFileTransmission: Bool = Self.default.allowKittyLocalFileTransmission,
+              sixelEnabled: Bool = Self.default.sixelEnabled,
+              maximumOscBytes: Int = Self.default.maximumOscBytes) {
         self.cols = cols
         self.rows = rows
         self.convertEol = convertEol
@@ -175,5 +198,7 @@ public struct TerminalOptions {
         self.initialBidiArrowKeySwap = initialBidiArrowKeySwap
         self.kittyGraphicsEnabled = kittyGraphicsEnabled
         self.allowKittyLocalFileTransmission = allowKittyLocalFileTransmission
+        self.sixelEnabled = sixelEnabled
+        self.maximumOscBytes = maximumOscBytes
     }
 }

@@ -204,6 +204,8 @@ Key options:
 | `cursorStyle` | `.blinkBlock` | Initial cursor appearance |
 | `screenReaderMode` | `false` | Accessibility mode |
 | `enableSixelReported` | `true` | Advertise Sixel support to applications |
+| `sixelEnabled` | `true` | Decode Sixel images; when `false` they are consumed and ignored |
+| `maximumOscBytes` | 64 MiB | Longest OSC string handled; a longer one is dropped and no more is buffered |
 | `initialBidiState` | implicit, autodetect, LTR | BiDi state for new paragraphs after startup or reset |
 | `maximumBidiParagraphRows` | `500` | Maximum rows processed as one BiDi paragraph |
 | `initialBidiArrowKeySwap` | `false` | Initial state for BiDi left/right arrow swapping |
